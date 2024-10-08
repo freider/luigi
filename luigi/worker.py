@@ -27,7 +27,7 @@ Everything in this module is private to luigi and may change in incompatible
 ways between versions. The exception is the exception types and the
 :py:class:`worker` config class.
 """
-
+import modal.functions
 import collections
 import collections.abc
 import datetime
@@ -50,6 +50,7 @@ import time
 import traceback
 
 from luigi import notifications
+import luigi
 from luigi.event import Event
 from luigi.task_register import load_task
 from luigi.scheduler import DISABLED, DONE, FAILED, PENDING, UNKNOWN, Scheduler, RetryPolicy
@@ -653,9 +654,7 @@ class Worker:
         """
         self._keep_alive_thread.stop()
         self._keep_alive_thread.join()
-        for task in self._running_tasks.values():
-            if task.is_alive():
-                task.terminate()
+        print("Exiting worker context with ", len(self._running_tasks), "tasks still running")
         self._task_result_queue.close()
         return False  # Don't suppress exception
 
@@ -807,6 +806,7 @@ class Worker:
                     if next.task_id not in seen:
                         self._validate_task(next)
                         seen.add(next.task_id)
+                        # TODO: good opportunity to run on modal
                         pool.apply_async(check_complete, [next, queue, self._task_completion_cache])
                         queue_size += 1
         except (KeyboardInterrupt, TaskException):
@@ -837,7 +837,8 @@ class Worker:
                 )
             self._batch_families_sent.add(family)
 
-    def _add(self, task, is_complete):
+    def _add(self, task: luigi.Task, is_complete):
+        print("Adding task", task)
         if self._config.task_limit is not None and len(self._scheduled_tasks) >= self._config.task_limit:
             logger.warning('Will not run %s or any dependencies due to exceeded task-limit of %d', task, self._config.task_limit)
             deps = None
@@ -1042,24 +1043,16 @@ class Worker:
             worker_state=r.get('worker_state', WORKER_STATE_ACTIVE),
         )
 
-    def _run_task(self, task_id):
+    def _run_task(self, task_id) -> modal.functions.FunctionCall:
         if task_id in self._running_tasks:
             logger.debug('Got already running task id {} from scheduler, taking a break'.format(task_id))
             next(self._sleeper())
             return
 
         task = self._scheduled_tasks[task_id]
-
-        task_process = self._create_task_process(task)
-
-        self._running_tasks[task_id] = task_process
-
-        if task_process.use_multiprocessing:
-            with fork_lock:
-                task_process.start()
-        else:
-            # Run in the same process
-            task_process.run()
+        modal_fc =task.spawn_modal_task()
+        self._running_tasks[task_id] = modal_fc
+        return modal_fc
 
     def _create_task_process(self, task):
         message_queue = multiprocessing.Queue() if task.accepts_messages else None
@@ -1075,26 +1068,6 @@ class Worker:
             task_completion_cache=self._task_completion_cache,
         )
 
-    def _purge_children(self):
-        """
-        Find dead children and put a response on the result queue.
-
-        :return:
-        """
-        for task_id, p in self._running_tasks.items():
-            if not p.is_alive() and p.exitcode:
-                error_msg = 'Task {} died unexpectedly with exit code {}'.format(task_id, p.exitcode)
-                p.task.trigger_event(Event.PROCESS_FAILURE, p.task, error_msg)
-            elif p.timeout_time is not None and time.time() > float(p.timeout_time) and p.is_alive():
-                p.terminate()
-                error_msg = 'Task {} timed out after {} seconds and was terminated.'.format(task_id, p.worker_timeout)
-                p.task.trigger_event(Event.TIMEOUT, p.task, error_msg)
-            else:
-                continue
-
-            logger.info(error_msg)
-            self._task_result_queue.put((task_id, FAILED, error_msg, [], []))
-
     def _handle_next_task(self):
         """
         We have to catch three ways a task can be "done":
@@ -1104,17 +1077,28 @@ class Worker:
            will be rescheduled and dependencies added,
         3. child process dies: we need to catch this separately.
         """
+        print("Handling next task")
+        def get_next_modal_result():
+            #self._task_result_queue.get(timeout=self._config.wait_interval)
+            modal_fc: modal.functions.FunctionCall
+            for task_id, modal_fc in self._running_tasks.items():
+                try:
+                    modal_fc.get(timeout=0)
+                    return task_id, DONE, "", []
+                except TimeoutError:
+                    continue
+                except Exception as e:
+                    return task_id, FAILED, str(e), []
+            else:
+                return None, None, None, None
         self._idle_since = None
         while True:
-            self._purge_children()  # Deal with subprocess failures
-
-            try:
-                task_id, status, expl, missing, new_requirements = (
-                    self._task_result_queue.get(
-                        timeout=self._config.wait_interval))
-            except Queue.Empty:
+            task_id, status, expl, missing = get_next_modal_result()
+            print("Got result", task_id, status, expl, missing)
+    
+            if task_id is None:
                 return
-
+            
             task = self._scheduled_tasks[task_id]
             if not task or task_id not in self._running_tasks:
                 continue
@@ -1126,14 +1110,6 @@ class Worker:
             if status == FAILED and not external_task_retryable:
                 self._email_task_failure(task, expl)
 
-            new_deps = []
-            if new_requirements:
-                new_req = [load_task(module, name, params)
-                           for module, name, params in new_requirements]
-                for t in new_req:
-                    self.add(t)
-                new_deps = [t.task_id for t in new_req]
-
             self._add_task(worker=self._id,
                            task_id=task_id,
                            status=status,
@@ -1143,7 +1119,7 @@ class Worker:
                            params=task.to_str_params(),
                            family=task.task_family,
                            module=task.task_module,
-                           new_deps=new_deps,
+                           new_deps=[],
                            assistant=self._assistant,
                            retry_policy_dict=_get_retry_policy_dict(task))
 
@@ -1162,7 +1138,7 @@ class Worker:
                 if reschedule:
                     self.add(task)
 
-            self.run_succeeded &= (status == DONE) or (len(new_deps) > 0)
+            self.run_succeeded &= (status == DONE)
             return
 
     def _sleeper(self):
@@ -1230,11 +1206,8 @@ class Worker:
 
         self._add_worker()
 
+        submitted_async_tasks = []
         while True:
-            while len(self._running_tasks) >= self.worker_processes > 0:
-                logger.debug('%d running tasks, waiting for next task to finish', len(self._running_tasks))
-                self._handle_next_task()
-
             get_work_response = self._get_work()
 
             if get_work_response.worker_state == WORKER_STATE_DISABLED:
@@ -1256,7 +1229,11 @@ class Worker:
 
             # task_id is not None:
             logger.debug("Pending tasks: %s", get_work_response.n_pending_tasks)
-            self._run_task(get_work_response.task_id)
+            modal_fc = self._run_task(get_work_response.task_id)
+            submitted_async_tasks.append(modal_fc)
+
+        for modal_fc in submitted_async_tasks:
+            modal_fc.get()
 
         while len(self._running_tasks):
             logger.debug('Shut down Worker, %d more tasks to go', len(self._running_tasks))
