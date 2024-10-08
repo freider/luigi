@@ -52,7 +52,7 @@ import traceback
 from luigi import notifications
 import luigi
 from luigi.event import Event
-from luigi.task_register import load_task
+from luigi.task_register import Register, load_task
 from luigi.scheduler import DISABLED, DONE, FAILED, PENDING, UNKNOWN, Scheduler, RetryPolicy
 from luigi.scheduler import WORKER_STATE_ACTIVE, WORKER_STATE_DISABLED
 from luigi.target import Target
@@ -646,12 +646,38 @@ class Worker:
                                                   self._handle_rpc_message)
         self._keep_alive_thread.daemon = True
         self._keep_alive_thread.start()
+        self._modal_app = modal.App("waluigi")
+        self._modal_functions = {}
+
+        def make_runner(f):
+            
+            def runner(param_kwargs, *args, **kwargs):
+                class Self:
+                    def __getattr__(self, item):
+                        return param_kwargs[item]    
+                f(Self(), *args, **kwargs)
+            return runner
+
+        for task_name in Register.task_names():
+            task_cls = Register.get_task_cls(task_name)
+            if task_cls.__module__.startswith("luigi."):
+                continue
+            if issubclass(task_cls, luigi.Config):
+                continue
+            modal_args, modal_kwargs = task_cls.run.modal_env
+            deco = self._modal_app.function(*modal_args, name=task_cls.__name__, serialized=True, **modal_kwargs)
+            modal_func = deco(make_runner(task_cls.run))
+            self._modal_functions[task_name] = modal_func
+
+        self._modal_run_ctx = self._modal_app.run()
+        self._modal_run_ctx.__enter__()
         return self
 
     def __exit__(self, type, value, traceback):
         """
         Stop the KeepAliveThread and kill still running tasks.
         """
+        self._modal_run_ctx.__exit__(type, value, traceback)
         self._keep_alive_thread.stop()
         self._keep_alive_thread.join()
         print("Exiting worker context with ", len(self._running_tasks), "tasks still running")
@@ -792,6 +818,7 @@ class Worker:
             queue = DequeQueue()
             pool = SingleProcessPool()
         self._validate_task(task)
+        # TODO: run on modal
         pool.apply_async(check_complete, [task, queue, self._task_completion_cache])
 
         # we track queue size ourselves because len(queue) won't work for multiprocessing
@@ -806,7 +833,7 @@ class Worker:
                     if next.task_id not in seen:
                         self._validate_task(next)
                         seen.add(next.task_id)
-                        # TODO: good opportunity to run on modal
+                        # TODO: run on modal
                         pool.apply_async(check_complete, [next, queue, self._task_completion_cache])
                         queue_size += 1
         except (KeyboardInterrupt, TaskException):
@@ -1050,7 +1077,9 @@ class Worker:
             return
 
         task = self._scheduled_tasks[task_id]
-        modal_fc =task.spawn_modal_task()
+
+        modal_func = self._modal_functions[task.__class__.__name__]
+        modal_fc = modal_func.spawn(task.param_kwargs)
         self._running_tasks[task_id] = modal_fc
         return modal_fc
 
