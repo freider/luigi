@@ -470,9 +470,6 @@ class Worker:
         """
         self._modal_run_ctx.__exit__(type, value, traceback)
         self._modal_result_queue_ctx.__exit__(type, value, traceback)
-        if MODAL_SCHEDULING:
-            self._completeness_results_queue_ctx.__exit__(type, value, traceback)
-
         self._keep_alive_thread.stop()
         self._keep_alive_thread.join()
         print("Exiting worker context with ", len(self._running_tasks), "tasks still running")
@@ -635,21 +632,14 @@ class Worker:
                 )
             self._batch_families_sent.add(family)
 
-    def _add(self, task: luigi.Task, is_complete: bool):
+    def _add_compleation_result(self, task: luigi.Task, is_complete: bool):
         self._add_task(
             worker=self._id,
             task_id=task.task_id,
             status=UNKNOWN,
             # deps=[],
             runnable=False,
-            priority=task.priority,
-            # resources=task.process_resources(),
-            # params=task.to_str_params(),
-            # family=task.task_family,
-            # module=task.task_module,
-            # batchable=task.batchable,
-            # retry_policy_dict=_get_retry_policy_dict(task),
-            # accepts_messages=task.accepts_messages,
+            priority=task.priority
         )
         if self._config.task_limit is not None and len(self._scheduled_tasks) >= self._config.task_limit:
             logger.warning('Will not run %s or any dependencies due to exceeded task-limit of %d', task, self._config.task_limit)
@@ -716,7 +706,6 @@ class Worker:
                 for d in deps:
                     self._validate_dependency(d)
                     task.trigger_event(Event.DEPENDENCY_DISCOVERED, task, d)
-                    print("Yielding dep", d)
                     yield d  # return additional tasks to add
 
                 deps = [d.task_id for d in deps]
@@ -942,8 +931,6 @@ class Worker:
         Returns True if all scheduled tasks were executed successfully.
         """
         logger.info('Running Worker with %d processes', self.worker_processes)
-
-        sleeper = self._sleeper()
         self.run_succeeded = True
 
         self._add_worker()  # register with the scheduler
@@ -953,45 +940,48 @@ class Worker:
             seen[t.task_id] = t
             self._queue_initial_task_status(t)
 
-        def get_next_modal_result() -> Tuple[luigi_modal.LuigiMethod, Any]:
+        def get_next_modal_result() -> List[Tuple[luigi_modal.LuigiMethod, Any]]:
             try:
-                return self._modal_result_queue.get(timeout=self._config.wait_interval)
+                print("Waiting for up to %f seconds for modal result" % self._config.wait_interval)
+                res = self._modal_result_queue.get_many(100, timeout=self._config.wait_interval)
+                print("que res", res)
+                return res
             except Queue.Empty:
-                return None, None
+                return [(None, None)]
 
         def _handle_next_queue_result():
-            op, args = get_next_modal_result()
-            if op is None:
-                return
-            self._modal_queued_ops -= 1
-            if op == luigi_modal.LuigiMethod.check_complete:
-                task_id, is_complete = args
-                task = seen[task_id]
-                for next_task in self._add(task, is_complete):
-                    if next_task.task_id not in seen:
-                        self._validate_task(next_task)
-                        seen[next_task.task_id] = next_task
-                        self._queue_initial_task_status(next_task)
+            for op, args in get_next_modal_result():
+                if op is None:
+                    return
+                self._modal_queued_ops -= 1
+                if op == luigi_modal.LuigiMethod.check_complete:
+                    task_id, is_complete = args
+                    task = seen[task_id]
+                    for next_task in self._add_compleation_result(task, is_complete):
+                        if next_task.task_id not in seen:
+                            self._validate_task(next_task)
+                            seen[next_task.task_id] = next_task
+                            self._queue_initial_task_status(next_task)
 
-            elif op == luigi_modal.LuigiMethod.run:
-                # reported run status from a task run
-                task_id, status, expl, missing = args
-                task = seen[task_id]
-                self.run_succeeded &= (status == DONE)
-                # report to scheduler
-                self._add_task(worker=self._id,
-                    task_id=task_id,
-                    status=status,
-                    expl=json.dumps(expl),
-                    resources=task.process_resources(),
-                    runnable=None,
-                    params=task.to_str_params(),
-                    family=task.task_family,
-                    module=task.task_module,
-                    new_deps=[],
-                    assistant=self._assistant,
-                    retry_policy_dict=_get_retry_policy_dict(task)
-                )
+                elif op == luigi_modal.LuigiMethod.run:
+                    # reported run status from a task run
+                    task_id, status, expl, missing = args
+                    task = seen[task_id]
+                    self.run_succeeded &= (status == DONE)
+                    # report to scheduler
+                    self._add_task(worker=self._id,
+                        task_id=task_id,
+                        status=status,
+                        expl=json.dumps(expl),
+                        resources=task.process_resources(),
+                        runnable=None,
+                        params=task.to_str_params(),
+                        family=task.task_family,
+                        module=task.task_module,
+                        new_deps=[],
+                        assistant=self._assistant,
+                        retry_policy_dict=_get_retry_policy_dict(task)
+                    )
 
         while True:
             get_work_response = self._get_work()
