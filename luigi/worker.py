@@ -63,6 +63,8 @@ from luigi.parameter import BoolParameter, FloatParameter, IntParameter, Optiona
 
 import json
 
+import luigi_modal
+
 logger = logging.getLogger('luigi-interface')
 
 # Prevent fork() from being called during a C-level getaddrinfo() which uses a process-global mutex,
@@ -649,27 +651,18 @@ class Worker:
         self._modal_app = modal.App("waluigi")
         self._modal_functions = {}
 
-        def make_runner(f):
-            
-            def runner(param_kwargs, *args, **kwargs):
-                class Self:
-                    def __getattr__(self, item):
-                        return param_kwargs[item]    
-                f(Self(), *args, **kwargs)
-            return runner
-
         for task_name in Register.task_names():
             task_cls = Register.get_task_cls(task_name)
             if task_cls.__module__.startswith("luigi."):
                 continue
             if issubclass(task_cls, luigi.Config):
                 continue
-            modal_args, modal_kwargs = task_cls.run.modal_env
-            deco = self._modal_app.function(*modal_args, name=task_cls.__name__, serialized=True, **modal_kwargs)
-            modal_func = deco(make_runner(task_cls.run))
+            modal_args, modal_kwargs = task_cls.modal_env
+            deco = self._modal_app.function(*modal_args, name=task_name, serialized=True, **modal_kwargs, mounts=[modal.Mount.from_local_python_packages("luigi_modal")])
+            modal_func = deco(luigi_modal.task_runner)
             self._modal_functions[task_name] = modal_func
 
-        self._modal_run_ctx = self._modal_app.run()
+        self._modal_run_ctx = self._modal_app.run(show_progress=True)
         self._modal_run_ctx.__enter__()
         return self
 
@@ -1079,7 +1072,7 @@ class Worker:
         task = self._scheduled_tasks[task_id]
 
         modal_func = self._modal_functions[task.__class__.__name__]
-        modal_fc = modal_func.spawn(task.param_kwargs)
+        modal_fc = modal_func.spawn(task)
         self._running_tasks[task_id] = modal_fc
         return modal_fc
 
