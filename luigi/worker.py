@@ -650,13 +650,15 @@ class Worker:
         self._keep_alive_thread.start()
         self._modal_app = modal.App("waluigi")
         self._modal_functions = {}
-
+        self._modal_result_queue_ctx = modal.Queue.ephemeral()
+        self._modal_result_queue = self._modal_result_queue_ctx.__enter__()
         for task_name in Register.task_names():
             task_cls = Register.get_task_cls(task_name)
             if task_cls.__module__.startswith("luigi."):
                 continue
             if issubclass(task_cls, luigi.Config):
                 continue
+            
             modal_args, modal_kwargs = task_cls.modal_env
             deco = self._modal_app.function(*modal_args, name=task_name, serialized=True, **modal_kwargs, mounts=[modal.Mount.from_local_python_packages("luigi_modal")])
             modal_func = deco(luigi_modal.task_runner)
@@ -671,6 +673,7 @@ class Worker:
         Stop the KeepAliveThread and kill still running tasks.
         """
         self._modal_run_ctx.__exit__(type, value, traceback)
+        self._modal_result_queue_ctx.__exit__(type, value, traceback)
         self._keep_alive_thread.stop()
         self._keep_alive_thread.join()
         print("Exiting worker context with ", len(self._running_tasks), "tasks still running")
@@ -1072,7 +1075,7 @@ class Worker:
         task = self._scheduled_tasks[task_id]
 
         modal_func = self._modal_functions[task.__class__.__name__]
-        modal_fc = modal_func.spawn(task)
+        modal_fc = modal_func.spawn(task, task_id, self._modal_result_queue)
         self._running_tasks[task_id] = modal_fc
         return modal_fc
 
@@ -1101,18 +1104,11 @@ class Worker:
         """
         print("Handling next task")
         def get_next_modal_result():
-            #self._task_result_queue.get(timeout=self._config.wait_interval)
-            modal_fc: modal.functions.FunctionCall
-            for task_id, modal_fc in self._running_tasks.items():
-                try:
-                    modal_fc.get(timeout=0)
-                    return task_id, DONE, "", []
-                except TimeoutError:
-                    continue
-                except Exception as e:
-                    return task_id, FAILED, str(e), []
-            else:
+            try:
+                return self._modal_result_queue.get(timeout=self._config.wait_interval)
+            except Queue.Empty:
                 return None, None, None, None
+
         self._idle_since = None
         while True:
             task_id, status, expl, missing = get_next_modal_result()
