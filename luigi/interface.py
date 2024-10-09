@@ -171,6 +171,7 @@ def _schedule_and_run(tasks, worker_scheduler_factory=None, override_defaults=No
     success = True
     logger = logging.getLogger('luigi-interface')
     with worker:
+        # TODO: run .add and .run in parallel
         for t in tasks:
             success &= worker.add(t, env_params.parallel_scheduling, env_params.parallel_scheduling_processes)
         logger.info('Done scheduling tasks')
