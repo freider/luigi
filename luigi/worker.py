@@ -82,7 +82,7 @@ fork_lock = threading.Lock()
 _WAIT_INTERVAL_EPS = 0.00001
 
 
-MODAL_SCHEDULING = False
+MODAL_SCHEDULING = bool(int(os.environ.get("MODAL_SCHEDULING", "0")))
 
 def _is_external(task):
     return task.run is None or task.run == NotImplemented
@@ -610,16 +610,19 @@ class Worker:
         """
         self._validate_task(task)
         
-        if MODAL_SCHEDULING:
-            self._modal_functions[task.__class__.__name__].spawn(
-                task,
-                task.task_id,
-                luigi_modal.LuigiMethod.check_complete,
-                self._completeness_results_queue
-            )
-        else:
-            self._completeness_results_queue.put((task.task_id, task.complete()))
+        def add_with_completness(task):
+            if MODAL_SCHEDULING:
+                self._modal_functions[task.__class__.__name__].spawn(
+                    task,
+                    task.task_id,
+                    luigi_modal.LuigiMethod.check_complete,
+                    self._completeness_results_queue,
+                    _future=True
+                )
+            else:
+                self._completeness_results_queue.put((task.task_id, task.complete()))
 
+        add_with_completness(task)
         # we track queue size ourselves because len(queue) won't work for multiprocessing
         queue_size = 1
         try:
@@ -632,15 +635,7 @@ class Worker:
                     if next_task.task_id not in seen:
                         self._validate_task(next_task)
                         seen[next_task.task_id] = next_task
-                        if MODAL_SCHEDULING:
-                            self._modal_functions[task.__class__.__name__].spawn(
-                                next_task,
-                                next_task.task_id,
-                                luigi_modal.LuigiMethod.check_complete,
-                                self._completeness_results_queue
-                            )
-                        else:
-                            self._completeness_results_queue.put((next_task.task_id, next_task.complete()))
+                        add_with_completness(next_task)
                         queue_size += 1
         except (KeyboardInterrupt, TaskException):
             raise
