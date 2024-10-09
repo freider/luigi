@@ -172,10 +172,10 @@ def _schedule_and_run(tasks, worker_scheduler_factory=None, override_defaults=No
     logger = logging.getLogger('luigi-interface')
     with worker:
         # TODO: run .add and .run in parallel
-        for t in tasks:
-            success &= worker.add(t, env_params.parallel_scheduling, env_params.parallel_scheduling_processes)
+        # for t in tasks:
+        #     success &= worker.add(t, env_params.parallel_scheduling, env_params.parallel_scheduling_processes)
         logger.info('Done scheduling tasks')
-        success &= worker.run()
+        success &= worker.run(tasks)
     luigi_run_result = LuigiRunResult(worker, success)
     logger.info(luigi_run_result.summary_text)
     if hasattr(sch, 'close'):

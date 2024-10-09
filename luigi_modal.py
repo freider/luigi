@@ -18,15 +18,18 @@ class LuigiMethod(enum.Enum):
 
 def task_runner(task: luigi.Task, task_id: str, op: LuigiMethod, result_queue: modal.Queue):
     if op == LuigiMethod.check_complete:
+        print("Checking completeness of", task_id)
         is_complete = task.complete()
-        result_queue.put((task.task_id, is_complete))
-
+        result_queue.put((op, (task.task_id, is_complete)))
+        print("Completed checking completeness of", task_id)
     elif op == LuigiMethod.run:
         try:
+            print("Running task", task_id)
             task.run()
         except Exception as e:
             print("Error running task", task_id)
-            result_queue.put((task_id, FAILED, str(e), []))
+            result_queue.put((op, (task_id, FAILED, str(e), [])))
             raise
         else:
-            result_queue.put((task_id, DONE, "", []))
+            print("Task complete", task_id)
+            result_queue.put((op, (task_id, DONE, "", [])))

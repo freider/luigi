@@ -27,7 +27,7 @@ Everything in this module is private to luigi and may change in incompatible
 ways between versions. The exception is the exception types and the
 :py:class:`worker` config class.
 """
-from typing import List
+from typing import Any, List, Tuple
 import modal.functions
 import collections
 import collections.abc
@@ -446,12 +446,7 @@ class Worker:
         self._modal_functions = {}
         self._modal_result_queue_ctx = modal.Queue.ephemeral()
         self._modal_result_queue = self._modal_result_queue_ctx.__enter__()
-        
-        self._completeness_results_queue_ctx = modal.Queue.ephemeral()
-        if MODAL_SCHEDULING:
-            self._completeness_results_queue = self._completeness_results_queue_ctx.__enter__()
-        else:
-            self._completeness_results_queue = Queue.Queue()
+        self._modal_queued_ops = 0
         
         for task_name in Register.task_names():
             task_cls = Register.get_task_cls(task_name)
@@ -465,7 +460,7 @@ class Worker:
             modal_func = deco(luigi_modal.task_runner)
             self._modal_functions[task_name] = modal_func
 
-        self._modal_run_ctx = self._modal_app.run(show_progress=True)
+        self._modal_run_ctx = self._modal_app.run(show_progress=False)
         self._modal_run_ctx.__enter__()
         return self
 
@@ -601,52 +596,30 @@ class Worker:
                 expl=error_message,
             )
         notifications.send_error_email(subject, error_message)
-
-    def add(self, task, multiprocess=False, processes=0):
-        """
-        Add a Task for the worker to check and possibly schedule and run.
-
-        Returns True if task and its dependencies were successfully scheduled or completed before.
-        """
-        self._validate_task(task)
-        
-        def add_with_completness(task):
-            if MODAL_SCHEDULING:
-                self._modal_functions[task.__class__.__name__].spawn(
-                    task,
-                    task.task_id,
-                    luigi_modal.LuigiMethod.check_complete,
-                    self._completeness_results_queue,
-                    _future=True
-                )
-            else:
-                self._completeness_results_queue.put((task.task_id, task.complete()))
-
-        add_with_completness(task)
-        # we track queue size ourselves because len(queue) won't work for multiprocessing
-        queue_size = 1
-        try:
-            seen = {task.task_id: task}
-            while queue_size:
-                task_id, is_complete = self._completeness_results_queue.get()
-                queue_size -= 1
-                item = seen[task_id]
-                for next_task in self._add(item, is_complete):
-                    if next_task.task_id not in seen:
-                        self._validate_task(next_task)
-                        seen[next_task.task_id] = next_task
-                        add_with_completness(next_task)
-                        queue_size += 1
-        except (KeyboardInterrupt, TaskException):
-            raise
-        except Exception as ex:
-            self.add_succeeded = False
-            formatted_traceback = traceback.format_exc()
-            self._log_unexpected_error(task)
-            task.trigger_event(Event.BROKEN_TASK, task, ex)
-            self._email_unexpected_error(task, formatted_traceback)
-            raise
-        return self.add_succeeded
+    
+    
+    def _queue_initial_task_status(self, task: Task):
+        self._add_task(
+            worker=self._id,
+            task_id=task.task_id,
+            status=UNKNOWN,
+            deps=[],
+            runnable=False,
+            priority=task.priority,
+        )
+        self._modal_queued_ops += 1
+        if MODAL_SCHEDULING:
+            # run the completeness check remotely
+            self._modal_functions[task.__class__.__name__].spawn(
+                task,
+                task.task_id,
+                luigi_modal.LuigiMethod.check_complete,
+                self._modal_result_queue,
+                _future=True
+            )
+        else:
+            # run the completeness check locally
+            self._modal_result_queue.put((luigi_modal.LuigiMethod.check_complete, (task.task_id, task.complete())), _future=True)
 
     def _add_task_batcher(self, task):
         family = task.task_family
@@ -662,8 +635,22 @@ class Worker:
                 )
             self._batch_families_sent.add(family)
 
-    def _add(self, task: luigi.Task, is_complete):
-        print("Adding task", task)
+    def _add(self, task: luigi.Task, is_complete: bool):
+        self._add_task(
+            worker=self._id,
+            task_id=task.task_id,
+            status=UNKNOWN,
+            # deps=[],
+            runnable=False,
+            priority=task.priority,
+            # resources=task.process_resources(),
+            # params=task.to_str_params(),
+            # family=task.task_family,
+            # module=task.task_module,
+            # batchable=task.batchable,
+            # retry_policy_dict=_get_retry_policy_dict(task),
+            # accepts_messages=task.accepts_messages,
+        )
         if self._config.task_limit is not None and len(self._scheduled_tasks) >= self._config.task_limit:
             logger.warning('Will not run %s or any dependencies due to exceeded task-limit of %d', task, self._config.task_limit)
             deps = None
@@ -729,6 +716,7 @@ class Worker:
                 for d in deps:
                     self._validate_dependency(d)
                     task.trigger_event(Event.DEPENDENCY_DISCOVERED, task, d)
+                    print("Yielding dep", d)
                     yield d  # return additional tasks to add
 
                 deps = [d.task_id for d in deps]
@@ -818,7 +806,6 @@ class Worker:
             return GetWorkResponse(None, 0, 0, 0, 0, WORKER_STATE_DISABLED)
 
         if self.worker_processes > 0:
-            logger.debug("Asking scheduler for work...")
             r = self._scheduler.get_work(
                 worker=self._id,
                 host=self.host,
@@ -877,6 +864,7 @@ class Worker:
         task = self._scheduled_tasks[task_id]
 
         modal_func = self._modal_functions[task.__class__.__name__]
+        self._modal_queued_ops += 1
         modal_fc = modal_func.spawn(task, task_id, luigi_modal.LuigiMethod.run, self._modal_result_queue, _future=True)
         self._running_tasks[task_id] = modal_fc
         return modal_fc
@@ -894,72 +882,6 @@ class Worker:
             check_complete_on_run=self._config.check_complete_on_run,
             task_completion_cache=self._task_completion_cache,
         )
-
-    def _handle_next_task(self):
-        """
-        We have to catch three ways a task can be "done":
-
-        1. normal execution: the task runs/fails and puts a result back on the queue,
-        2. new dependencies: the task yielded new deps that were not complete and
-           will be rescheduled and dependencies added,
-        3. child process dies: we need to catch this separately.
-        """
-        print("Handling next task")
-        def get_next_modal_result():
-            try:
-                return self._modal_result_queue.get(timeout=self._config.wait_interval)
-            except Queue.Empty:
-                return None, None, None, None
-
-        self._idle_since = None
-        while True:
-            task_id, status, expl, missing = get_next_modal_result()
-            print("Got result", task_id, status, expl, missing)
-    
-            if task_id is None:
-                return
-            
-            task = self._scheduled_tasks[task_id]
-            if not task or task_id not in self._running_tasks:
-                continue
-                # Not a running task. Probably already removed.
-                # Maybe it yielded something?
-
-            # external task if run not implemented, retry-able if config option is enabled.
-            external_task_retryable = _is_external(task) and self._config.retry_external_tasks
-            if status == FAILED and not external_task_retryable:
-                self._email_task_failure(task, expl)
-
-            self._add_task(worker=self._id,
-                           task_id=task_id,
-                           status=status,
-                           expl=json.dumps(expl),
-                           resources=task.process_resources(),
-                           runnable=None,
-                           params=task.to_str_params(),
-                           family=task.task_family,
-                           module=task.task_module,
-                           new_deps=[],
-                           assistant=self._assistant,
-                           retry_policy_dict=_get_retry_policy_dict(task))
-
-            self._running_tasks.pop(task_id)
-
-            # re-add task to reschedule missing dependencies
-            if missing:
-                reschedule = True
-
-                # keep out of infinite loops by not rescheduling too many times
-                for task_id in missing:
-                    self.unfulfilled_counts[task_id] += 1
-                    if (self.unfulfilled_counts[task_id] >
-                            self._config.max_reschedules):
-                        reschedule = False
-                if reschedule:
-                    self.add(task)
-
-            self.run_succeeded &= (status == DONE)
-            return
 
     def _sleeper(self):
         # TODO is exponential backoff necessary?
@@ -1015,7 +937,7 @@ class Worker:
         self._config.keep_alive = False
         self._stop_requesting_work = True
 
-    def run(self):
+    def run(self, initial_tasks: List[Task]):
         """
         Returns True if all scheduled tasks were executed successfully.
         """
@@ -1026,35 +948,64 @@ class Worker:
 
         self._add_worker()  # register with the scheduler
 
+        seen = {}
+        for t in initial_tasks:
+            seen[t.task_id] = t
+            self._queue_initial_task_status(t)
+
+        def get_next_modal_result() -> Tuple[luigi_modal.LuigiMethod, Any]:
+            try:
+                return self._modal_result_queue.get(timeout=self._config.wait_interval)
+            except Queue.Empty:
+                return None, None
+
+        def _handle_next_queue_result():
+            op, args = get_next_modal_result()
+            if op is None:
+                return
+            self._modal_queued_ops -= 1
+            if op == luigi_modal.LuigiMethod.check_complete:
+                task_id, is_complete = args
+                task = seen[task_id]
+                for next_task in self._add(task, is_complete):
+                    if next_task.task_id not in seen:
+                        self._validate_task(next_task)
+                        seen[next_task.task_id] = next_task
+                        self._queue_initial_task_status(next_task)
+
+            elif op == luigi_modal.LuigiMethod.run:
+                # reported run status from a task run
+                task_id, status, expl, missing = args
+                task = seen[task_id]
+                self.run_succeeded &= (status == DONE)
+                # report to scheduler
+                self._add_task(worker=self._id,
+                    task_id=task_id,
+                    status=status,
+                    expl=json.dumps(expl),
+                    resources=task.process_resources(),
+                    runnable=None,
+                    params=task.to_str_params(),
+                    family=task.task_family,
+                    module=task.task_module,
+                    new_deps=[],
+                    assistant=self._assistant,
+                    retry_policy_dict=_get_retry_policy_dict(task)
+                )
+
         while True:
             get_work_response = self._get_work()
 
-            if get_work_response.worker_state == WORKER_STATE_DISABLED:
-                self._start_phasing_out()
-
-            if get_work_response.task_id is None:
-                if not self._stop_requesting_work:
-                    self._log_remote_tasks(get_work_response)
-                if len(self._running_tasks) == 0:
-                    self._idle_since = self._idle_since or datetime.datetime.now()
-                    if self._keep_alive(get_work_response):
-                        next(sleeper)
-                        continue
-                    else:
-                        break
-                else:
-                    self._handle_next_task()
-                    continue
-
-            # task_id is not None:
-            logger.debug("Pending tasks: %s", get_work_response.n_pending_tasks)
-            t0 = time.monotonic()
-            self._run_task(get_work_response.task_id)
-            print("Time to spawn task", time.monotonic() - t0)
-
-        while len(self._running_tasks):
-            logger.debug('Shut down Worker, %d more tasks to go', len(self._running_tasks))
-            self._handle_next_task()
+            if get_work_response.task_id is not None:
+                # task_id is not None - run stuff!
+                logger.info("Running task %s", get_work_response.task_id)
+                logger.debug("Pending tasks: %s", get_work_response.n_pending_tasks)
+                self._run_task(get_work_response.task_id)
+            elif self._modal_queued_ops == 0:
+                print("No more work + no more expected status updates - breaking")
+                break
+            else:
+                _handle_next_queue_result()
 
         return self.run_succeeded
 
