@@ -969,7 +969,7 @@ class Worker:
         logger.debug("There are no more tasks to run at this time")
         if get_work_response.running_tasks:
             for r in get_work_response.running_tasks:
-                logger.debug('%s is currently run by worker %s', r['task_id'], r['worker'])
+                logger.debug('%s is currently running', r['task_id'])
         elif get_work_response.n_pending_tasks:
             logger.debug(
                 "There are %s pending tasks possibly being run by other workers",
