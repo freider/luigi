@@ -167,6 +167,7 @@ class TaskProcess(multiprocessing.Process):
             next_send = requires.paths
 
     def run(self):
+        raise Exception("Should not get in here")
         logger.info('[pid %s] Worker %s running   %s', os.getpid(), self.worker_id, self.task)
 
         if self.use_multiprocessing:
@@ -652,6 +653,10 @@ class Worker:
         self._modal_functions = {}
         self._modal_result_queue_ctx = modal.Queue.ephemeral()
         self._modal_result_queue = self._modal_result_queue_ctx.__enter__()
+        
+        self._completeness_results_queue_ctx = modal.Queue.ephemeral()
+        self._completeness_results_queue = self._completeness_results_queue_ctx.__enter__()
+        
         for task_name in Register.task_names():
             task_cls = Register.get_task_cls(task_name)
             if task_cls.__module__.startswith("luigi."):
@@ -674,6 +679,7 @@ class Worker:
         """
         self._modal_run_ctx.__exit__(type, value, traceback)
         self._modal_result_queue_ctx.__exit__(type, value, traceback)
+        self._completeness_results_queue_ctx.__exit__(type, value, traceback)
         self._keep_alive_thread.stop()
         self._keep_alive_thread.join()
         print("Exiting worker context with ", len(self._running_tasks), "tasks still running")
@@ -807,30 +813,32 @@ class Worker:
         if self._first_task is None and hasattr(task, 'task_id'):
             self._first_task = task.task_id
         self.add_succeeded = True
-        if multiprocess:
-            queue = multiprocessing.Manager().Queue()
-            pool = multiprocessing.Pool(processes=processes if processes > 0 else None)
-        else:
-            queue = DequeQueue()
-            pool = SingleProcessPool()
         self._validate_task(task)
-        # TODO: run on modal
-        pool.apply_async(check_complete, [task, queue, self._task_completion_cache])
+        self._modal_functions[task.__class__.__name__].spawn(
+            task,
+            task.task_id,
+            luigi_modal.LuigiMethod.check_complete,
+            self._completeness_results_queue
+        )
 
         # we track queue size ourselves because len(queue) won't work for multiprocessing
         queue_size = 1
         try:
-            seen = {task.task_id}
+            seen = {task.task_id: task}
             while queue_size:
-                current = queue.get()
+                task_id, is_complete = self._completeness_results_queue.get()
                 queue_size -= 1
-                item, is_complete = current
-                for next in self._add(item, is_complete):
-                    if next.task_id not in seen:
-                        self._validate_task(next)
-                        seen.add(next.task_id)
-                        # TODO: run on modal
-                        pool.apply_async(check_complete, [next, queue, self._task_completion_cache])
+                item = seen[task_id]
+                for next_task in self._add(item, is_complete):
+                    if next_task.task_id not in seen:
+                        self._validate_task(next_task)
+                        seen[next_task.task_id] = next_task
+                        self._modal_functions[task.__class__.__name__].spawn(
+                            next_task,
+                            next_task.task_id,
+                            luigi_modal.LuigiMethod.check_complete,
+                            self._completeness_results_queue
+                        )
                         queue_size += 1
         except (KeyboardInterrupt, TaskException):
             raise
@@ -841,9 +849,6 @@ class Worker:
             task.trigger_event(Event.BROKEN_TASK, task, ex)
             self._email_unexpected_error(task, formatted_traceback)
             raise
-        finally:
-            pool.close()
-            pool.join()
         return self.add_succeeded
 
     def _add_task_batcher(self, task):
@@ -965,7 +970,6 @@ class Worker:
         self._scheduler.add_worker(self._id, self._worker_info)
 
     def _log_remote_tasks(self, get_work_response):
-        logger.debug("Done")
         logger.debug("There are no more tasks to run at this time")
         if get_work_response.running_tasks:
             for r in get_work_response.running_tasks:
@@ -1075,7 +1079,7 @@ class Worker:
         task = self._scheduled_tasks[task_id]
 
         modal_func = self._modal_functions[task.__class__.__name__]
-        modal_fc = modal_func.spawn(task, task_id, self._modal_result_queue)
+        modal_fc = modal_func.spawn(task, task_id, luigi_modal.LuigiMethod.run, self._modal_result_queue)
         self._running_tasks[task_id] = modal_fc
         return modal_fc
 

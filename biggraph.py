@@ -22,6 +22,10 @@ class ChildTask(luigi.Task):
         print("Running on Modal", self.i)
         time.sleep(1)
 
+    def complete(self):
+        # simulated slow completeness check
+        time.sleep(2)
+        return False
 
 if __name__ == "__main__":
     luigi.build([RootTask()], local_scheduler=True)
