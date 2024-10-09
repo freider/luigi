@@ -1,4 +1,5 @@
 import enum
+import traceback
 import modal
 import luigi
 from luigi.task_status import DONE, FAILED
@@ -24,6 +25,8 @@ def task_runner(task: luigi.Task, task_id: str, op: LuigiMethod, result_queue: m
         try:
             task.run()
         except Exception as e:
-            return result_queue.put((task_id, FAILED, str(e), []))
+            print("Error running task", task_id)
+            result_queue.put((task_id, FAILED, str(e), []))
+            raise
         else:
-            return result_queue.put((task_id, DONE, "", []))
+            result_queue.put((task_id, DONE, "", []))
