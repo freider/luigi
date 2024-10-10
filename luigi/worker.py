@@ -632,7 +632,7 @@ class Worker:
                 )
             self._batch_families_sent.add(family)
 
-    def _add_compleation_result(self, task: luigi.Task, is_complete: bool):
+    def _add_completion_result(self, task: luigi.Task, is_complete: bool):
         self._add_task(
             worker=self._id,
             task_id=task.task_id,
@@ -944,7 +944,6 @@ class Worker:
             try:
                 print("Waiting for up to %f seconds for modal result" % self._config.wait_interval)
                 res = self._modal_result_queue.get_many(100, timeout=self._config.wait_interval)
-                print("que res", res)
                 return res
             except Queue.Empty:
                 return [(None, None)]
@@ -957,7 +956,7 @@ class Worker:
                 if op == luigi_modal.LuigiMethod.check_complete:
                     task_id, is_complete = args
                     task = seen[task_id]
-                    for next_task in self._add_compleation_result(task, is_complete):
+                    for next_task in self._add_completion_result(task, is_complete):
                         if next_task.task_id not in seen:
                             self._validate_task(next_task)
                             seen[next_task.task_id] = next_task
@@ -984,6 +983,7 @@ class Worker:
                     )
 
         while True:
+            print("getting work")
             get_work_response = self._get_work()
 
             if get_work_response.task_id is not None:

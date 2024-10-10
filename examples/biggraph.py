@@ -13,6 +13,8 @@ DEPLOY_CONCURRENCY = 10
 
 
 def random_sleep():
+    time.sleep(15)
+    return
     # 20% 0-5s
     # 70% 5-10s
     # 10% 10-15s
